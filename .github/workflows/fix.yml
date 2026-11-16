@@ -1,0 +1,73 @@
+name: nitro-fix
+on:
+  workflow_dispatch:
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev libcbor-dev libgnutls28-dev libssl-dev \
+            git curl jq musl-tools clang gcc
+      - name: Build QEMU v9.2
+        run: |
+          git clone --depth 1 --branch v9.2.0 https://gitlab.com/qemu-project/qemu.git
+          cd qemu
+          ./configure --target-list=x86_64-softmmu --disable-docs
+          make -j"$(nproc)"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build nitro-cli
+        run: |
+          git clone --depth 1 --branch v1.4.4 https://github.com/aws/aws-nitro-enclaves-cli.git
+          cd aws-nitro-enclaves-cli
+          make vsock-proxy-native nitro-cli-native
+          NITRO_CLI_INSTALL_DIR=/tmp/nitro-install make install-tools
+          sudo cp -a /tmp/nitro-install/. /
+          sudo mkdir -p /var/log/nitro_enclaves; sudo chmod 777 /var/log/nitro_enclaves
+          nitro-cli --version
+      - name: Build EIF
+        run: |
+          git clone --depth 1 https://github.com/circlefin/arc-remote-signer.git
+          cd arc-remote-signer
+          docker buildx create --use --name nitrobuilder || true
+          docker buildx bake --provenance=false --allow fs.read=./docker/certs enclave
+          nitro-cli build-enclave --docker-uri nitro-enclave-signer/enclave:latest --output-file enclave.eif
+          nitro-cli describe-eif --eif-path enclave.eif | tee describe_eif.json
+      - name: Build vhost
+        run: |
+          git clone --depth 1 https://github.com/rust-vmm/vhost-device.git
+          cd vhost-device
+          cargo build --release --bin vhost-device-vsock
+      - name: UDS heartbeat + QEMU TCG
+        continue-on-error: true
+        run: |
+          set -x
+          cd arc-remote-signer
+          python3 - <<'PY' > /tmp/heartbeat.log 2>&1 &
+          import socket,os
+          p='/tmp/vm16.vsock_9000'
+          try: os.unlink(p)
+          except: pass
+          s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(p); s.listen(1)
+          print('listening',p); c,_=s.accept(); d=c.recv(16); print('got',d.hex());
+          c.sendall(b'\xb7'); print('sent b7'); c.close(); s.close()
+          PY
+          ./../vhost-device/target/release/vhost-device-vsock --guest-cid=16 --socket=/tmp/vsock.sock --uds-path=/tmp/vm16.vsock > /tmp/vhost.log 2>&1 &
+          sleep 2
+          timeout 60s ./../qemu/build/qemu-system-x86_64 -M nitro-enclave,vsock=c,id=arc -kernel enclave.eif -nographic -m 2G -accel tcg -cpu max -chardev socket,id=c,path=/tmp/vsock.sock > /tmp/qemu.log 2>&1 || true
+          echo '=== heartbeat ==='; cat /tmp/heartbeat.log
+          echo '=== vhost ==='; cat /tmp/vhost.log
+          echo '=== qemu ==='; head -120 /tmp/qemu.log; tail -40 /tmp/qemu.log
+      - name: R1 UDS attempt
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import socket
+          try:
+              s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(5); s.connect('/tmp/vm16.vsock'); s.sendall(b'CONNECT 10350\n'); print('resp',s.recv(256))
+          except Exception as e: print('R1 ERR',repr(e))
+          PY
